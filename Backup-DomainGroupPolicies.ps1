@@ -1,90 +1,117 @@
-[CmdletBinding(DefaultParameterSetName="none")]
+<#
+.SYNOPSIS
+Backup-DomainGroupPolicies Allows a user to create a .zip file filled with the current Group Policies in the domain.
+These packages can also be restored from this script (It will also link these back to the OUs).
+
+The naming scheme for the zip files is:
+GPOBackup-month-day-year-hour-minute
+
+.DESCRIPTION
+Facilitates the backing up and restoring of Group Policies.
+
+.EXAMPLE
+./Backup-DomainGroupPolicies
+Backup all policies in a Domain.
+
+.EXAMPLE
+./Backup-DomainGroupPolicies -Path \\file-server\backups -Policies "random policy",laps
+Backup all policies in a Domain with a specified output path and only specified policies.
+
+.EXAMPLE
+./Backup.DomainGroupPolicies -Path C:\path\GPOBackup-04-16-2018-02-00
+Restoring from a package generate by this script.
+.LINK
+https://github.com/bandit145/Backup-DomainGroupPolicies
+
+#>
 param(
-    [Parameter(ParameterSetName="backup",Mandatory=$True)]
-    [Int]$RetentionDays,
-    [Parameter(ParameterSetName="restore",Mandatory=$True)]
-    [String]$RestorePackage,
-    [String]$Path=(Get-Item -Path ./).FullName+"\"
+    [Switch]$Restore,
+    [String]$Path=(Get-Item -Path ./).FullName,
+    [Array]$Policies=$null
 )
 
 $ErrorActionPreference = "Stop"
-
 Add-Type -Assembly "system.io.compression.filesystem"
 
 try{
     Import-Module -Name "GroupPolicy","ActiveDirectory"
 }
 catch {
-    Write-Error "GroupPolicy module is missing! Please install RSAT tools!"
+    Write-Error "GroupPolicy/ActiveDirectory module is missing! Please install RSAT tools! https://www.microsoft.com/en-us/download/details.aspx?id=45520"
 }
 
-function Get-GPOManifest{
-    param($gpo)
-    $manifest = New-Object -TypeName psobject -Property @{Name="";Links=[System.Collections.ArrayList]@();ID=""}
-    [xml]$xml_report = Get-GPOReport -Name $gpo.displayname -ReportType xml
-    $manifest.Name = $xml_report.GPO.Name
-    $manifest.ID = $xml_report.GPO.Identifier.Identifier."#text".Trim("{}")
-    if ($xml_report.GPO.LinksTo.length -gt 0){
-        foreach ($link in $xml_report.GPO.LinksTo){
-            [System.Collections.ArrayList]$dn = (Get-ADDomain).DistinguishedName.Split(",")
-            foreach ($path in $link.SOMPath.Split("/")){
-                if (($link.SOMPath.Split("/")).IndexOf($path) -gt 0){
-                    $dn.Add("ou=$path") | Out-Null
-                }
+function Get-Links{
+    param($links)
+    $proper_links = [System.Collections.ArrayList]@()
+    foreach ($link in $links){
+        [System.Collections.ArrayList]$dn = (Get-ADDomain).DistinguishedName.Split(",")
+        #just grabbin it from one place instead of splitting it again
+        $dn.Reverse()
+        foreach ($path in $link.SOMPath.Split("/")){
+            if (($link.SOMPath.Split("/")).IndexOf($path) -gt 0){
+                $dn.Add("ou=$path") | Out-Null
             }
-            $manifest.Links.Add($dn -join ",") | Out-Null
         }
+        #reverse to put into proper ldap dn order
+        $dn.Reverse()
+        $proper_links.Add($dn -join ",") | Out-Null
     }
-    return $manifest
+    return $proper_links
 }
 
 function Backup-GPOs{
-    $backup_dir = New-Item -Path (-join($Path,"GPOBackup-",(Get-Date -UFormat "%m-%d-%y-%H"))) -Type Directory
-    foreach($gpo in Get-GPO -All){
-        $gpo_dir = New-Item -Path (-join($backup_dir.FullName,"\",$gpo.displayname)) -Type Directory
-        Get-GPOManifest -gpo $gpo | ConvertTo-Json | Out-File -FilePath (-join($gpo_dir.FullName,"\manifest.json"))
-        Backup-GPO -Name $gpo.displayname -Path (-join($backup_dir.FullName,"\",$gpo.displayname))
+    $package_manifest = @{GPOs=[System.Collections.ArrayList]@()}
+    #month-day-year-hour-minute
+    $backup_dir = New-Item -Path (-join($Path,"GPOBackup-",(Get-Date -UFormat "%m-%d-%Y-%H-%M"))) -Type Directory
+    if ($Policies){
+        foreach ($policy in $Policies){
+           Backup-GPO -Name $policy -Path $backup_dir.FullName | Out-Null
+        }
     }
-    #[io.compression.zipfile]::CreateFromDirectory($backup_dir.FullName,(-join($backup_dir.FullName,".zip")))
-    #Remove-item -Path $backup_dir.FullName  -Recurse
+    else{
+        Backup-GPO -All -Path $backup_dir.FullName | Out-Null
+    }
+    [io.compression.zipfile]::CreateFromDirectory($backup_dir.FullName,(-join($backup_dir.FullName,".zip")))
+    Remove-item -Path $backup_dir.FullName  -Recurse -Force
+    Write-Output (-join("INFO: All policies specified have been backed up to ",$backup_dir,".zip"))
 }
 
 function Restore-GPOs{
-    Expand-Archive -FilePath $RestorePackage -OutputPath $Path
-    $package_name = $RestorePackage.split("\")[$RestorePackage.Split("\").Length-1]
-    $backup_path= $Path+"\"+$package_name+"\"+$package_name
-    foreach($file in (Get-ChildItem -Path $unzipped_file -Recurse)){
-        $gpo_info = Get-Content -Path
-        #see if the gpo exists if not do a full restore and relink (only if ou exists)
-        #if it does exist just do a restore 
+    $temp_folder = -join((Split-Path $SCRIPT:Myinvocation.mycommand.path -Parent),"\temp_gpo")
+    New-Item -Path $temp_folder -Type Directory | Out-Null
+    [io.compression.zipfile]::ExtractToDirectory($Path,$temp_folder)
+    foreach($file in (Get-ChildItem -Path $temp_folder -Exclude "*.xml")){
+        [xml]$gpo_info = Get-Content -Path (-join($file.FullName,"\gpreport.xml"))
         try{
-            Get-GPO -Name $gpo_info.Name
-            Restore-GPO -Path (-join($backup_path,"\",$gpo_info.Name))
+            Get-GPO -Name $gpo_info.GPO.Name | Out-Null
+            Write-Output (-join("INFO: ",$gpo_info.GPO.Name," exists in AD, importing settings!"))
         }
         catch{
-            Import-GPO -BackupGPOName $gpo_info.Name -TargetGPOName $gpo_info.Name -Path $backup_path -CreateIfNeeded
+            Write-Output (-join("INFO: ",$gpo_info.GPO.Name," is missing from AD, creating GPO!"))
         }
-        foreach($link in $gpo_info.Link){
+        Import-GPO -BackupGPOName $gpo_info.GPO.Name -TargetName $gpo_info.GPO.Name -Path $temp_folder -CreateIfNeeded | Out-Null
+        foreach($link in (Get-Links $gpo_info.GPO.LinksTo)){
             if (Test-Path "AD:\$link"){
-                New-GPLink -Name $gpo_info.Name -LinkEnabled yes
+                try{
+                    New-GPLink -Name $gpo_info.GPO.Name -Target $link -LinkEnabled yes | Out-Null
+                    Write-Output (-join("INFO: Linking ",$gpo_info.GPO.Name," to ",$link))
+                }
+                catch{
+                    Write-Output (-join("WARN: ",$gpo_info.GPO.Name," already seems linked to ",$link,", Continuing..."))
+                }
             }
             else{
-                Write-Output "INFO: "+$link+" does not exist on Domain, Ignoring and continuing for "+$gpo_info.Name
+                Write-Output (-join("INFO: ",$link," does not exist on Domain, Ignoring and continuing for ",$gpo_info.GPO.Name))
             }
         }
     }
+    Remove-item -Path $temp_folder -Recurse -Force
 }
 
-function Main{
-    Write-Output $path
     
-    if($psCmdlet.ParameterSetName -eq "restore"){
-        Restore-GPOs
-    }
-    else{
-        Backup-GPOs
-    }
-
+if($Restore){
+    Restore-GPOs
 }
-
-Main
+else{
+    Backup-GPOs
+}
