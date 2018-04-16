@@ -60,7 +60,6 @@ function Get-Links{
 }
 
 function Backup-GPOs{
-    $package_manifest = @{GPOs=[System.Collections.ArrayList]@()}
     #month-day-year-hour-minute
     $backup_dir = New-Item -Path (-join($Path,"GPOBackup-",(Get-Date -UFormat "%m-%d-%Y-%H-%M"))) -Type Directory
     if ($Policies){
